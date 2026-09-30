@@ -6,6 +6,8 @@ use embassy_ptp_driver::{Clock, ScaledPpm, Timestamp as PtpTimestamp};
 
 use super::Instance;
 
+const NANOS_PER_SECOND: u32 = 1_000_000_000;
+
 fn from_offset_nanos(offset_nanos: i64) -> (PtpTimestamp, bool) {
     let subtract = offset_nanos < 0;
     let nanos = if subtract {
@@ -21,6 +23,16 @@ fn from_offset_nanos(offset_nanos: i64) -> (PtpTimestamp, bool) {
     };
 
     (PtpTimestamp::from_seconds_and_nanos(seconds, nanos), subtract)
+}
+
+fn encode_time_update(timestamp: PtpTimestamp, subtract: bool) -> (u32, u32) {
+    if subtract {
+        // In subtraction mode, the hardware expects the seconds and
+        // nanoseconds update values in complemented form.
+        (timestamp.seconds().wrapping_neg(), NANOS_PER_SECOND - timestamp.nanos())
+    } else {
+        (timestamp.seconds(), timestamp.nanos())
+    }
 }
 
 /// Ethernet MAC PTP subsecond increment.
@@ -264,10 +276,11 @@ fn apply_time_update<T: Instance>(timestamp: PtpTimestamp, subtract: bool, updat
 }
 
 fn write_time_update<T: Instance>(timestamp: PtpTimestamp, subtract: bool) {
+    let (seconds, nanos) = encode_time_update(timestamp, subtract);
     let mac = T::regs().ethernet_mac();
-    mac.macstsur().write(|w| w.set_tss(timestamp.seconds()));
+    mac.macstsur().write(|w| w.set_tss(seconds));
     mac.macstnur().write(|w| {
-        w.set_tsss(timestamp.nanos());
+        w.set_tsss(nanos);
         w.set_addsub(subtract);
     });
 }
@@ -282,7 +295,7 @@ fn wait_timestamp_init_or_update_clear<T: Instance>() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClockRate, PtpSubsecondIncrement};
+    use super::{ClockRate, PtpSubsecondIncrement, encode_time_update, from_offset_nanos};
 
     #[test]
     fn addend_for_200mhz_8ns() {
@@ -300,5 +313,37 @@ mod tests {
     #[should_panic]
     fn addend_rejects_impossible_rate() {
         ClockRate::from_hclk(200_000_000, PtpSubsecondIncrement::from_nanos(5).unwrap());
+    }
+
+    #[test]
+    fn positive_offset_uses_direct_update_values() {
+        let (timestamp, subtract) = from_offset_nanos(1_000_085_000);
+
+        assert!(!subtract);
+        assert_eq!(encode_time_update(timestamp, subtract), (1, 85_000));
+    }
+
+    #[test]
+    fn negative_fractional_offset_uses_complemented_update_values() {
+        let (timestamp, subtract) = from_offset_nanos(-85_000);
+
+        assert!(subtract);
+        assert_eq!(encode_time_update(timestamp, subtract), (0, 999_915_000));
+    }
+
+    #[test]
+    fn negative_mixed_offset_uses_complemented_update_values() {
+        let (timestamp, subtract) = from_offset_nanos(-1_000_085_000);
+
+        assert!(subtract);
+        assert_eq!(encode_time_update(timestamp, subtract), (u32::MAX, 999_915_000));
+    }
+
+    #[test]
+    fn negative_whole_second_uses_one_second_subsecond_complement() {
+        let (timestamp, subtract) = from_offset_nanos(-1_000_000_000);
+
+        assert!(subtract);
+        assert_eq!(encode_time_update(timestamp, subtract), (u32::MAX, 1_000_000_000));
     }
 }
